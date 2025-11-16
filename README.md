@@ -23,23 +23,12 @@ GitHub Address：[https://github.com/Co-Sight-Series/Co-Sight-Lab](https://githu
 
 ## 🛠Installation Guide
 
-1. **Download the project**：You can choose one of the following methods to download the project to your local computer：
+1. **Download the project**：You can clone the repository directly via the SSH URL:
    
-   **1. Use Git clone**
-   Visit https://github.com/ZTE-AICloud/Co-Sight ，Click on the green 'Code' button,
-
    ```bash
-   # 1. Select HTTP protocol
-   git clone https://github.com/ZTE-AICloud/Co-Sight.git
-   
-   # 2. Select SSH
-   git clone git@github.com:ZTE-AICloud/Co-Sight.git
-   
+   git clone ssh://git@ssh.github.com:443/ddwhzh/Co-Sight.git
    cd Co-Sight
    ```
-
-   **2. Download the zip file**
-   Visit https://github.com/ZTE-AICloud/Co-Sight ， Click on the green 'Code' button, select 'Download ZIP', download it and unzip it to enter the project directory.
 
 2. **Prepare the environment**：python version >= 3.11
   

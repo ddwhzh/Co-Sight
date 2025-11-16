@@ -22,23 +22,12 @@ GitHub 地址：[https://github.com/Co-Sight-Series/Co-Sight-Lab](https://github
 
 ## 🛠安装指南
 
-1. **下载项目**：你可以选择以下任意一种方式下载项目到本地：
-   
-   **方式一：使用 Git 克隆**
-   访问 https://github.com/ZTE-AICloud/Co-Sight ，点击绿色的 `Code` 按钮，
+1. **下载项目**：请使用以下 SSH 地址克隆仓库：
 
    ```bash
-   # 方式一：选择http协议
-   git clone https://github.com/ZTE-AICloud/Co-Sight.git
-   
-   # 方式二：选择ssh协议
-   git clone git@github.com:ZTE-AICloud/Co-Sight.git
-   
+   git clone ssh://git@ssh.github.com:443/ddwhzh/Co-Sight.git
    cd Co-Sight
    ```
-
-   **方式二：下载 ZIP 文件**
-   访问 https://github.com/ZTE-AICloud/Co-Sight ， 点击绿色的 `Code` 按钮，选择 `Download ZIP`，下载后解压并进入项目目录。
 
 2. **准备环境**：python版本>=3.11
   
