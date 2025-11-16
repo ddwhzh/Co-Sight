@@ -26,9 +26,19 @@ def get_model_config() -> dict[str, Optional[str | int | float]]:
     """获取API配置"""
     max_tokens = os.environ.get("MAX_TOKENS")
     temperature = os.environ.get("TEMPERATURE")
-    os.environ['OPENAI_API_KEY'] = os.environ.get("API_KEY")
+
+    # 优先使用 API_KEY，其次兼容已有的 OPENAI_API_KEY，且避免向环境写入 None
+    api_key = os.environ.get("API_KEY")
+    if not api_key:
+        # 向后兼容只配置了 OPENAI_API_KEY 的场景
+        api_key = os.environ.get("OPENAI_API_KEY")
+
+    if api_key:
+        # 仅在非空时同步 OPENAI_API_KEY，避免 TypeError: str expected, not NoneType
+        os.environ["OPENAI_API_KEY"] = api_key
+
     return {
-        "api_key": os.environ.get("API_KEY"),
+        "api_key": api_key,
         "base_url": os.environ.get("API_BASE_URL"),
         "model": os.environ.get("MODEL_NAME"),
         "max_tokens": int(max_tokens) if max_tokens and max_tokens.strip() else None,

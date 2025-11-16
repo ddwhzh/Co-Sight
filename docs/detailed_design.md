@@ -85,8 +85,13 @@
 
 ## 6. 模型与配置
 
-- `.env` 中提供通用模型配置（`API_KEY`、`API_BASE_URL`、`MODEL_NAME` 等）以及可选的 `PLAN_*`、`ACT_*`、`TOOL_*`、`VISION_*`、`CREDIBILITY_*`、`BROWSER_*` 组。
+- `.env` 中提供通用模型配置（`API_KEY`、`API_BASE_URL`、`MODEL_NAME` 等）以及可选的 `PLAN_*`、`ACT_*`、`TOOL_*`、`VISION_*`、`CREDIBILITY_*`、`BROWSER_*` 组。**实现状态**：已由 `config/config.py` 中的 `get_model_config` 及各 `get_*_model_config` 函数读取并组装配置。
 - `config/config.py` 返回对应配置，`llm.py` 依次初始化 `llm_for_plan`、`llm_for_act` 等；`cosight_server/deep_research/main.py` 会在启动时打印哪些变量缺失。
+- **缺少 API_KEY 的处理流程（本次变更新增设计）**：
+  - `get_model_config` 读取 `API_KEY` 后，不再直接将其写入 `os.environ['OPENAI_API_KEY']`，而是先校验是否为非空字符串。
+  - 若 `API_KEY` 为空或缺失，函数抛出带有明确指引的异常（例如提示需要在 `.env` 或运行环境中配置 `API_KEY`），并通过日志记录详细错误，避免出现 `TypeError: str expected, not NoneType` 这类不直观的错误。
+  - 仅当校验通过时才写入 `os.environ['OPENAI_API_KEY']`，后续 `OpenAI` 客户端与其他依赖该环境变量的组件才会被初始化。
+  - **实现状态**：上述行为将通过修改 `config/config.py:get_model_config` 与根目录 `llm.py` 中的初始化流程来实现。
 - `custom_config` 提供运行时的 `base_api_url`、`base_chatbot_api_url`、`search_port` 等；`websocket_manager` 根据 `custom_config.get("search_port")` 拼接 HTTP 请求地址。
 
 ## 7. 扩展指引
@@ -132,3 +137,186 @@
 5. **人机协作**：UI 收到 `lui-message-tool-event` 与 `credibility` 事件，可提示用户某一步失败或证据不足，由人工选择“重跑 / 补规划 / 终止”，避免系统陷入不可控循环。
 
 综上，Co-Sight 通过“Plan 全局状态 + 事件广播 + 失败标记 + 可选 re-plan”形成了 DAG 可观测与失败回退机制，解决“Plan 可能错误 + Agent 重复失败”两类问题。
+
+## 11. 质量与可信度判定的实现映射
+
+本节将 `docs/requirements.md` 第 11 章中的质量与异常判定规则，映射到当前代码实现位置，说明哪些已经落地，哪些是推荐增强点。
+
+### 11.1 Plan 不可分解 / 规划失败（P1/P2）
+
+- **P1：无步骤 / Plan 空**  
+  - `Plan.steps` 的写入由 `PlanToolkit.create_plan` 负责，随后在 `CoSight.execute` 中通过 `Plan.get_ready_steps()` 做可执行性检测。  
+  - **关键代码**：  
+    - 计划写入：`PlanToolkit.create_plan`（`app/cosight/tool/plan_toolkit.py`）。  
+    - 就绪步骤计算：`Plan.get_ready_steps`（`app/cosight/task/todolist.py`）。  
+  - 当前实现中，若 `Plan.steps` 为空，则 `get_ready_steps()` 始终返回空列表，被视为“无可执行步骤”进入 P2 场景。
+
+- **P2：无可执行步骤 + 重试耗尽**  
+  - 在 `CoSight.execute` 中，存在如下重试逻辑：  
+    - 初始化时使用 `TaskPlannerAgent.create_plan` 生成 Plan；  
+    - 若 `self.plan.get_ready_steps()` 为空，则在 `question` 中追加失败原因并再次调用 `create_plan`，最多重试 3 次；  
+    - 若重试后仍无 ready steps，则跳出循环，后续 `finalize_plan` 生成总结。  
+  - **关键代码**（示例）：  
+
+```47:55:CoSight.py
+    @time_record
+    def execute(self, question, output_format=""):
+        create_task = question
+        retry_count = 0
+        while not self.plan.get_ready_steps() and retry_count < 3:
+            create_result = self.task_planner_agent.create_plan(create_task, output_format)
+            create_task += f"\nThe plan creation result is: {create_result}\nCreation failed, please carefully review the plan creation rules and select the create_plan tool to create the plan"
+            retry_count += 1
+```
+
+- **设计建议（尚未完全实现部分）**：
+  - 当重试次数耗尽后，建议显式在 `Plan.result` 中写入“plan creation failed after N retries”类文案，并通过 `plan_report_event_manager.publish("plan_result", plan)` 推送给前端，使 `example_task_flows.md` 第 3 章的失败案例与实现完全对齐。
+
+### 11.2 Actor 结果错误（A1/A2）
+
+- **A1：执行异常 → 步骤 blocked**  
+  - `TaskActorAgent.act` 在执行单个步骤时，先把该步骤置为 `in_progress`，调用 `BaseAgent.execute` 执行工具链；若过程中抛出异常，则在 `except` 中将该步骤状态标记为 `blocked`：  
+
+```150:171:app/cosight/agent/actor/task_actor_agent.py
+        self.plan.mark_step(step_index, step_status="in_progress")
+        plan_report_event_manager.publish("plan_process", self.plan)
+        ...
+        try:
+            result = self.execute(self.history, step_index=step_index)
+            if self.plan.step_statuses.get(self.plan.steps[step_index], "") == "in_progress":
+                self.plan.mark_step(step_index, step_status="completed", step_notes=str(result))
+                # 步骤完成后，主动上报一次计划进度，确保前端收到manus-step
+                plan_report_event_manager.publish("plan_process", self.plan)
+            return result
+        except Exception as e:
+            logger.error(f"Error executing step {step_index}: {e}", exc_info=True)
+            self.plan.mark_step(step_index, step_status="blocked", step_notes=str(e))
+            # 步骤失败同样上报一次计划进度
+            plan_report_event_manager.publish("plan_process", self.plan)
+            return str(e)
+```
+
+  - **效果**：  
+    - `Plan.step_statuses[step]` 被置为 `blocked`。  
+    - 通过 `plan_report_event_manager.publish("plan_process", self.plan)` 推送更新，前端可据此高亮失败步骤。
+
+- **A2：工具级错误 → tool_error 事件**  
+  - 工具调用统一经由 `BaseAgent._execute_tool_call`，在出错时会推送 `tool_error` 事件：  
+
+```535:548:app/cosight/agent/base/base_agent.py
+        except Exception as e:
+            duration = time.time() - start_time
+            error_msg = str(e)
+            
+            # 推送工具执行错误事件
+            self._push_tool_event("tool_error", function_name, function_args, 
+                                "", step_index, duration, error_msg)
+            
+            logger.error(f"Unhandled exception: {e}", exc_info=True)
+            return {
+                "role": "tool",
+                "name": function_name,
+                "tool_call_id": tool_call_id,
+                "content": f"Execution error: {str(e)}"
+            }
+```
+
+  - `_push_tool_event` 将 `event_type="tool_error"` 的事件发布给 `plan_report_event_manager`，由 SSE 层映射为 `contentType=lui-message-tool-event`，前端可以在 UI 中展示错误详情。
+
+### 11.3 Actor 结果不可信（可信度评估 C1/C2/C3）
+
+- **可信分析触发与输入**  
+  - 当某步骤状态变为 `completed` 时，`append_create_plan` / `append_create_plan_local` 会调用 `_trigger_credibility_analysis`，后者异步执行：  
+
+```114:125:cosight_server/deep_research/routers/search.py
+async def _trigger_credibility_analysis(plan_queue, plan_data: Plan, completed_step: str):
+    """触发可信分析 - 异步执行，不阻塞主流程"""
+    ...
+    task = asyncio.create_task(_async_credibility_analysis(plan_queue, plan_data, completed_step))
+```
+
+  - `_async_credibility_analysis` 从 `Plan` 中收集当前步骤信息、所有已完成步骤、以及来自 `Plan.step_tool_calls` 的工具事件，调用 `credibility_analyzer.analyze_step_credibility`：  
+
+```162:176:cosight_server/deep_research/routers/search.py
+        credibility_result = await credibility_analyzer.analyze_step_credibility(
+            current_step, all_completed_steps, tool_events
+        )
+        ...
+        credibility_message = credibility_analyzer.format_credibility_message(
+            credibility_result, completed_step, step_index
+        )
+        ...
+        await plan_queue.put(credibility_message)
+```
+
+- **可信分析内部逻辑**  
+  - 在 `CredibilityAnalyzer.analyze_step_credibility` 中，当前实现会：  
+    - 根据步骤标题检测语言；  
+    - 构建专用 prompt，将步骤内容与工具结果编码为输入；  
+    - 调用专用 LLM，并解析返回的 JSON，补全五类可信度字段；  
+    - 返回一个 `{truth, verified_facts, searchable_facts, derived_facts, educated_guess}` 字典。  
+  - **关键代码**：
+
+```220:279:cosight_server/deep_research/services/credibility_analyzer.py
+    async def analyze_step_credibility(...):
+        ...
+        response = llm.chat_to_llm(messages)
+        ...
+        credibility_result = self._parse_llm_response(response)
+        credibility_result = self._ensure_complete_result(
+            credibility_result,
+            current_step,
+            all_completed_steps,
+            tool_events,
+            language
+        )
+        ...
+        return credibility_result
+```
+
+- **可信度等级（trusted/needs_review/untrusted）的建议实现位置**  
+  - 需求文档中 C1/C2/C3 的规则目前尚未在代码中显式计算。推荐的实现方式是：  
+    - 在 `CredibilityAnalyzer` 内新增方法 `compute_level(credibility_result: Dict[str, List[str]]) -> str`，根据各列表长度返回 `trusted` / `needs_review` / `untrusted`。  
+    - 在 `format_credibility_message` 中调用 `compute_level`，并将结果写入返回的消息结构中，例如增加字段 `credibilityLevel`。  
+    - 前端在渲染 `lui-message-credibility-analysis` 时，依据 `credibilityLevel` 调整样式（高亮低可信步骤，或在 Plan 汇总处给出整体可信度概览）。
+
+## 12. 监控与指标平台（设计中，尚未实现）
+
+本节对应 `docs/requirements.md` 第 7 章中“监控与指标平台”的非功能需求，给出推荐的技术落地方案，并明确当前代码尚未实现该平台，仅有日志与回放能力。
+
+### 12.1 已有可观测性能力（代码已实现）
+
+- **应用级日志**：  
+  - 统一日志入口 `app/common/logger_util.py`，使用 `CompressedRotatingFileHandler` 将日志写入 `logs/co-sight.log`，并按大小轮转压缩到 `logs/bak`，默认包含时间、进程、线程、级别、文件名与行号。  
+  - `logger.exception` 被重写为带 `exc_info=True`，所有未处理异常会带堆栈写入日志，便于排查启动失败、LLM 调用异常、外部 API 错误等问题。
+- **任务级日志与回放**：  
+  - 每个任务的工作区 `work_space/work_space_{timestamp}` 中包含：  
+    - `plans/plan.log`：由 `append_create_plan_local` 按 Plan 更新写入，记录 `steps`、`step_statuses`、`step_notes`、`step_tool_calls`、`dependencies`、`result` 等。  
+    - `plans/plan.final.json`：任务最终 Plan 快照，含总结结果。  
+    - `replay.json`：由 `RecordGenerator` 将 SSE 流逐行落盘，可通过 `/deep-research/replay/workspaces` 列举并回放。  
+  - 通过上述文件可以还原某个 `plan_id` 在 Planner/Actor/工具/可信分析层面的行为，用于事后审计。
+
+### 12.2 监控与指标平台的推荐设计（尚未在代码中实现）
+
+为满足“内置监控/指标平台”的需求，推荐在当前架构基础上增加以下组件（本节为设计草案，尚未对应任何 .py 文件实现）：
+
+- **Metrics 采集层（设计建议）**：  
+  - 在关键路径（`/deep-research/search` 入口、`CoSight.execute` 规划循环、`TaskActorAgent.act`、`BaseAgent._execute_tool_call`、`credibility_analyzer.analyze_step_credibility` 等）增加统一的指标采集钩子，统计例如：  
+    - 请求级：调研任务 QPS、平均/分位耗时、失败率。  
+    - Plan 级：平均步骤数、平均重试次数、规划失败率（无 ready steps）。  
+    - 步骤级：`completed/blocked` 比例、每类工具调用次数与错误率。  
+    - 可信度级：不同 `credibilityLevel` 的步骤占比（待 `compute_level` 实现后）。  
+  - 推荐通过内嵌 metrics 客户端（如 Prometheus client 或自定义 in-memory 结构）聚合指标，再曝光为 HTTP `/metrics` 接口。
+
+- **监控展示与告警（设计建议）**：  
+  - 在 API 层新增只读监控接口，例如：  
+    - `/deep-research/metrics/summary`：返回当前进程指标摘要（JSON），方便前端或外部监控系统拉取。  
+    - `/deep-research/metrics/plan/{plan_id}`：返回某个计划的执行统计（步骤状态分布、工具错误次数、可信度分布等）。  
+  - 可选地对接 Prometheus/Grafana：  
+    - 使用 Prometheus 抓取 `/metrics` 指标；  
+    - 在 Grafana 中配置 dashboard 展示任务成功率、延迟、各类错误率与外部服务依赖状态。  
+  - 当前仓库中 **尚未存在上述接口和集成代码**，本节仅给出设计方向。
+
+- **实现边界说明**：  
+  - 本版本仅实现了“日志 + 工作区 + 回放”层级的可观测性，没有统一的 metrics 聚合、HTTP 指标接口或图形化监控面板；  
+  - 如需实现本节设计，需新增专门的监控模块（例如 `cosight_server/deep_research/monitoring.py`），并在关键路径中插入指标采集调用，保持与现有日志体系解耦。

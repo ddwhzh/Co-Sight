@@ -83,6 +83,8 @@
 - **性能**：单任务最多并发步骤 = ready steps 数量，默认无硬限制；建议 LLM 端点能支撑至少 5 TPS。
 - **日志**：必须至少有 `plan.log`, `plan.final.json`, `replay.json`；异常需 `logger.error(..., exc_info=True)`。
 - **可观测性**：工具事件必须记录 `raw_result_length` 与 `verification.steps`，以便排查幻觉。
+- **监控与指标平台**：系统应提供内置的指标与监控面板，用于观测任务级与系统级的关键指标，例如：请求 QPS、各阶段耗时（规划/执行/工具调用/可信分析）、各类错误率（LLM 调用失败、工具失败、步骤 blocked 比例）、外部服务依赖的健康状态等，并支持按 `plan_id`/工作区回溯调试。  
+  - **当前实现状态**：仅提供文件日志（`logs/co-sight.log`）以及 `work_space/**` 下的 `plan.log` 与 `replay.json`，用于事后排查；尚未集成 Prometheus/Grafana 等指标系统，也没有统一的 HTTP metrics 接口或可视化监控面板。该能力目前为规划需求，具体设计见 `docs/detailed_design.md` 中的监控章节，尚未在代码中落地。
 
 ## 8. 验收标准
 
@@ -96,6 +98,8 @@
 ## 9. 约束与假设
 
 - **依赖**：需要可访问的大模型（OpenAI 兼容 API），可选搜索 API（Tavily/Google）；需配置 `.env`。
+- **LLM 配置约定**：`.env` 中建议提供通用模型配置 `API_KEY`、`API_BASE_URL`、`MODEL_NAME` 等环境变量；Planner/Actor/Tool/Vision 等专用模型可通过 `PLAN_*`、`ACT_*`、`TOOL_*`、`VISION_*` 等前缀覆盖。**实现状态**：这一约定已在 `config/config.py` 的 `get_model_config` 及各 `get_*_model_config` 函数中实现。
+- **缺失配置处理**：当 `API_KEY` 未配置或为空时，系统应当仍能正常启动 UI 与 HTTP 服务，只在实际发起调研任务（调用 LLM）时通过响应内容或日志给出清晰的错误提示，而不是在导入阶段抛出类型错误导致进程退出。**实现状态**：本次修改将更新 `config/config.py` 与根目录 `llm.py`，避免向 `OPENAI_API_KEY` 写入 `None`，并在缺少关键配置时进行日志告警与运行时降级处理。
 - **运行环境**：Python 3.11+ 或 Docker。Windows 需使用 PowerShell/WSL 以获得更佳体验。
 - **安全**：暂不提供账号体系；生产部署需在网关层加鉴权。
 - **Re-plan**：默认不自动触发；若需自动化，请在 `CoSight.execute` 检测 `Plan.has_blocked_steps()` 并调用 `TaskPlannerAgent.re_plan()`。
@@ -106,3 +110,60 @@
 - 外部搜索/网页接口受限：`ToolResultProcessor.check_embeddable` 需要外网，如受限需配置 `BROWSER_PROXY_URL` 或缓存策略。
 - `work_space` 累积占用磁盘：需运维定期清理或配额管理。
 - 未自动回退 DAG：需要产品或算法策略决定何时触发 re-plan，避免任务一直卡在 blocked 状态。
+
+## 11. 质量与异常判定（Plan / Actor / 可信度）
+
+本节约定“Plan 不可分解”“Actor 结果错误”“Actor 结果不可信”在需求侧的判定标准，并给出当前代码实现或落地点。
+
+### 11.1 Plan 不可分解 / 规划失败
+
+- **判定目标**：当 Planner 多次尝试仍无法产出可执行 DAG 时，需要向用户明确反馈“计划创建失败”，而不是静默卡死。
+- **结构性判定条件（代码已支持或易于支持）**：
+  - **P1：无步骤**：`Plan.steps` 为空，或仅包含 1 个无实质语义的占位步骤。  
+    - **实现位置**：`Plan.steps` 由 `PlanToolkit.create_plan` 写入（`app/cosight/tool/plan_toolkit.py`），在 `CoSight.execute` 中通过 `Plan.get_ready_steps()` 进行可执行性判断（`CoSight.py`）。
+  - **P2：无可执行步骤**：在 `CoSight.execute` 中，调用 `Plan.get_ready_steps()` 发现为空时，按 FR-01.1 逻辑在 `question` 中附加失败原因并最多重试 3 次；若重试耗尽后仍无 ready steps，即视为当前 Plan 不可执行。  
+    - **实现位置**：`CoSight.execute` 中的重试循环与 `Plan.get_ready_steps`（`app/cosight/task/todolist.py`）。
+- **需求约定**：
+  - 达到上述条件后，系统必须：
+    - 向 `Plan.result` 写入简要失败原因。
+    - 通过 `plan_report_event_manager.publish("plan_result", plan)` 推送到前端（`TaskPlannerAgent.finalize_plan` 当前已实现成功场景，失败场景可复用该路径）。
+  - **现状说明**：FR-01.1 的“重试 3 次并提示失败”逻辑已在 `CoSight.execute` 与 `example_task_flows.md` 第 3 章以文字说明，但未对 P1/P2 做明确枚举，开发实现应以本节为准补齐。
+
+### 11.2 Actor 结果错误（执行失败）
+
+- **判定目标**：当某一步骤在工具执行或 LLM 处理过程中发生明确错误时，应把该步骤标记为“失败（blocked）”，并在 UI 中显式展示。
+- **硬错误判定条件（代码已实现）**：
+  - **A1：执行异常**：`TaskActorAgent.act` 在执行过程中抛出异常（例如工具异常、网络错误、LLM 调用异常）。  
+    - **实现行为**：  
+      - 调用 `self.plan.mark_step(step_index, step_status="blocked", step_notes=str(e))`。  
+      - 通过 `plan_report_event_manager.publish("plan_process", self.plan)` 推送事件。  
+      - **代码位置**：`TaskActorAgent.act`（`app/cosight/agent/actor/task_actor_agent.py`）。  
+  - **A2：工具级错误**：`BaseAgent._execute_tool_call` 在调用具体工具函数时发生异常。  
+    - **实现行为**：  
+      - 通过 `_push_tool_event("tool_error", ...)` 推送 `tool_error` 事件（含 `error` 字段）。  
+      - 若该调用关联某个步骤，结合 A1 将该步骤最终标记为 `blocked`。  
+      - **代码位置**：`_execute_tool_call` 与 `_push_tool_event`（`app/cosight/agent/base/base_agent.py`）。
+- **需求约定**：
+  - 被标记为 `blocked` 的步骤在前端必须以“失败”样式展示（例如红色标注），而不是与正常 `completed` 步骤同样对待。
+  - 后续可以由 Planner 触发 `re_plan` 或人工手动重试（对应 `docs/detailed_design.md` 第 9 节中描述的“Re-plan 能力与回退策略”）。
+
+### 11.3 Actor 结果不可信（低可信度）
+
+- **判定目标**：在步骤执行“成功”（未抛异常）的情况下，通过可信分析评估其结论是否可靠，并给出“可信度等级”，用于提示用户是否需要人工复核。
+- **输入信号**：可信分析结果 `CredibilityMessage`，来自 `credibility_analyzer.analyze_step_credibility`，包含 5 类结论：
+  - `truth`（常识/真理）、`verified_facts`（已验证事实）、`searchable_facts`（可搜索事实）、`derived_facts`（推导事实）、`educated_guess`（有根据的猜测）。  
+  - **代码位置**：`CredibilityAnalyzer`（`cosight_server/deep_research/services/credibility_analyzer.py`），消息封装见 `format_credibility_message`。
+- **需求侧可信度等级定义（V1 约定，前端/后端可按需实现）**：
+  - **C1：高可信 trusted**  
+    - 条件示例：`verified_facts` 至少包含 1 条；`educated_guess` 条数不超过 1 条。  
+    - 建议 UI 表现：正常展示，无明显警示。
+  - **C2：中等可信 needs_review**  
+    - 条件示例：`verified_facts` 为空，但 `searchable_facts` 或 `derived_facts` 至少包含 1 条，说明结论可查证但尚未完全落在“已验证事实”上。  
+    - 建议 UI 表现：在步骤或可信分析卡片上提示“建议人工复核”。
+  - **C3：低可信 untrusted**  
+    - 条件示例之一：`verified_facts`、`searchable_facts`、`derived_facts` 全部为空，仅存在 `truth` 和/或 `educated_guess`。  
+    - 条件示例之二：可信分析返回空结构（仅触发兜底回退文案）。  
+    - 建议 UI 表现：高亮“低可信/仅为猜测”，不直接作为最终结论。
+- **实现映射建议**（当前仓库尚未实现等级计算，需后续增强）：
+  - 推荐在 `CredibilityAnalyzer` 内新增一个 `compute_level(credibility_result) -> str` 方法，根据上述规则返回 `trusted/needs_review/untrusted`，并作为字段追加到 `CredibilityMessage` 中，然后由前端据此调整展示样式。
+  - 该逻辑应在 `docs/detailed_design.md` 中详细描述实现路径，确保前后端对同一等级含义达成一致。

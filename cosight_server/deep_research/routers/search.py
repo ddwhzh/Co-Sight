@@ -518,7 +518,29 @@ async def search(request: Request, params: Any = Body(None)):
                 plan_report_event_manager.subscribe("tool_event", plan_id, append_create_plan_local)
                 logger.info(f"Event subscription completed for plan_id: {plan_id}")
 
-                # 初始化CoSight并传入plan_id
+                # 初始化CoSight并传入plan_id；如 LLM 配置缺失，则直接返回可读错误而不是抛异常
+                if not llm_for_plan or not llm_for_act or not llm_for_tool or not llm_for_vision:
+                    logger.error(
+                        "LLM 配置不完整，无法执行调研任务。plan_llm=%s, act_llm=%s, tool_llm=%s, vision_llm=%s",
+                        bool(llm_for_plan),
+                        bool(llm_for_act),
+                        bool(llm_for_tool),
+                        bool(llm_for_vision),
+                    )
+                    try:
+                        from app.cosight.task.todolist import Plan as _Plan
+                        from app.cosight.task.task_manager import TaskManager as _TaskManager
+
+                        # 构造一个仅包含错误信息的 Plan，并通过事件总线推送给前端
+                        plan = _Plan()
+                        _TaskManager.set_plan(plan_id, plan)
+                        error_msg = "LLM 配置缺失，请在 .env 或运行环境中设置 API_KEY / API_BASE_URL / MODEL_NAME 后重试。"
+                        plan.set_plan_result(error_msg)
+                        plan_report_event_manager.publish("plan_result", plan)
+                    except Exception as e:
+                        logger.error(f"构造配置错误 Plan 失败: {e}", exc_info=True)
+                    return
+
                 logger.info(f"llm is {llm_for_plan.model}, {llm_for_plan.base_url}, {llm_for_plan.api_key}")
                 cosight = CoSight(
                     llm_for_plan,
@@ -526,7 +548,7 @@ async def search(request: Request, params: Any = Body(None)):
                     llm_for_tool,
                     llm_for_vision,
                     work_space_path=work_space_path_time,
-                    message_uuid = plan_id
+                    message_uuid=plan_id
                 )
                 result = cosight.execute(query_content)
                 logger.info(f"final result is {result}")

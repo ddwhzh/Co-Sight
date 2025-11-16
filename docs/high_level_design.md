@@ -54,4 +54,7 @@
 - **LLM 可靠性**：`BaseAgent.check_and_fix_tool_call_params` 最多重试三次修复 JSON，并提供空字典兜底；但对于工具强依赖结构化输出的场景仍需在提示词上加强约束。
 - **工作区爆炸**：每个任务创建独立目录，需配合定期清理策略；`work_space` 下文件可能包含敏感信息，建议配合访问控制或脱敏策略。
 - **外部工具超时**：`ToolResultProcessor.check_embeddable` 调用 HTTP 资源，存在阻塞风险；生产环境应设置代理与超时并开启缓存。
+- **配置缺失但服务可用性保障**：系统依赖 `.env` 中的 `API_KEY`、`API_BASE_URL`、`MODEL_NAME` 等环境变量来初始化 LLM 客户端。为避免在 `config/config.py:get_model_config` 中向 `OPENAI_API_KEY` 写入 `None` 触发 `TypeError` 从而阻塞服务启动，本次设计要求在写入前进行显式校验，缺失关键配置时仅记录日志并在实际调用 LLM 时返回可读的错误信息，而非中断 FastAPI 进程。**实现状态**：该行为将通过修改 `config/config.py` 与根目录 `llm.py` 落地。
+- **Plan 与 Actor 质量治理**：规划阶段通过 `CoSight.execute`+`Plan.get_ready_steps()` 实现“无 ready steps 时最多重试 3 次”的兜底策略（对应需求文档 FR-01.1 和第 11 章中 Plan 不可分解的判定）；执行阶段通过 `TaskActorAgent.act` 的 `blocked` 标记和 `BaseAgent._execute_tool_call` 的 `tool_error` 事件显式暴露失败步骤；在此基础上，`CredibilityAnalyzer` 提供五类可信信息用于构建“可信度等级”，形成“结构可执行 + 执行无异常 + 证据可信”的三层质量保障框架。
+- **监控与指标平台缺失**：当前仅实现了文件日志（`logs/co-sight.log`）与工作区级别的 `plan.log`/`replay.json` 回放机制，没有统一的 metrics 聚合与可视化监控平台，也未集成 Prometheus/Grafana 或暴露 `/metrics` 等接口。监控平台被视为后续扩展能力，其需求与推荐实现方案在 `docs/requirements.md` 和 `docs/detailed_design.md` 中已有描述，但尚未落地到代码。
 

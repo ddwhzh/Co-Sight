@@ -149,3 +149,61 @@
 - **用户体验**：
   - 成功案例：生成可回放、可审计的完整调研报告。
   - 失败案例：快速、明确地反馈失败原因，引导用户调整任务输入，而不是“无响应”。
+
+## 5 执行阶段的失败与低可信度结果（补充）
+
+本节补充两类执行阶段的“非成功”路径，对应 `docs/requirements.md` 第 11 章中的 A1/A2/C1–C3 判定规则。
+
+### 5.1 步骤执行失败：Actor 抛异常 → blocked 步骤
+
+#### 5.2.1 场景说明
+
+- 角色：分析师。
+- 任务输入：正常的调研问题，例如“分析某公司的竞争优势”。
+- 在执行某一步骤（如“抓取官网年报 PDF 并解析”）时，底层工具因为网络问题或文件解析错误抛出异常。
+
+#### 5.2.2 用户视角流程
+
+1. 用户发起调研任务，前半段步骤执行正常，UI 中可以看到部分步骤被标记为“已完成”。
+2. 某一步骤在执行过程中突然停住，不再继续推进后续步骤。
+3. UI 中该步骤在 DAG 上标记为失败（例如红色），并在步骤详情或工具事件列表中显示错误信息（来自 `tool_error` 事件和 `step_notes`）。
+4. 用户可以选择：
+   - 修改输入或环境后重新发起任务；
+   - 或通过后续支持的 re-plan 机制重新规划。
+
+#### 5.2.3 后端技术视角流程
+
+1. `CoSight.execute` 通过 `Plan.get_ready_steps()` 找到可执行的步骤索引列表，为每个步骤创建 `TaskActorAgent` 线程（见 2.3 成功案例）。
+2. 某个步骤的 `TaskActorAgent.act` 执行过程中，调用 `BaseAgent.execute`、`_execute_tool_calls`，最终落到某个具体工具函数（例如 `fetch_website_content` 或 `extract_document_content`）。
+3. 工具抛出异常后：
+   - `BaseAgent._execute_tool_call` 在 `except` 分支中构造 `tool_error` 事件，通过 `_push_tool_event` 推送到 `plan_report_event_manager`，SSE 将其转为 `lui-message-tool-event` 发送给前端。
+   - 异常继续冒泡到 `TaskActorAgent.act`，被 `except` 捕获，调用 `self.plan.mark_step(step_index, step_status="blocked", step_notes=str(e))` 将该步骤标记为 `blocked`，并再次调用 `plan_report_event_manager.publish("plan_process", self.plan)` 推送更新（对应 `docs/detailed_design.md` 第 11.2 节）。
+4. 后续 `Plan.get_ready_steps()` 不再返回该步骤，且由于有 blocked 步骤存在，系统需要由上层策略决定是否 re-plan 或终止任务。
+
+### 5.2 执行成功但可信度较低：可信分析标记为“需复核 / 低可信”
+
+#### 场景说明
+
+- 角色：分析师。
+- 任务输入：需要综合多个来源的复杂问题，例如“预测某行业未来五年的市场规模”。
+- 某些步骤虽然执行成功（工具和 LLM 都未报错），但更多依赖推测或缺乏权威数据，属于“结果不够可信”的情况。
+
+#### 用户视角流程
+
+1. 用户发起任务，步骤陆续完成，UI 中大部分步骤显示为“已完成”。
+2. 对于某些步骤，右侧可信分析卡片中：
+   - `verified_facts` 很少甚至为空；
+   - `searchable_facts`、`derived_facts` 和 `educated_guess` 条目明显较多；
+   - 整体呈现“建议复核/低可信”的语义（具体文案可由前端基于 `credibilityLevel` 或字段分布设计）。
+3. 用户可以基于这些信息决定：
+   - 是否需要进一步搜索或补充证据；
+   - 是否只把这些结论作为参考建议，而不是正式结论。
+
+#### 后端技术视角流程
+
+1. 某步骤执行成功后，`TaskActorAgent.act` 调用 `self.plan.mark_step(step_index, step_status="completed", step_notes=str(result))`，并通过 `plan_report_event_manager.publish("plan_process", self.plan)` 推送计划更新。
+2. `append_create_plan_local` 检测到该步骤状态变为 `completed`，调用 `_trigger_credibility_analysis` 启动异步可信分析任务。
+3. `_async_credibility_analysis` 从 `Plan.step_tool_calls` 中收集该步骤的工具调用记录，将其与当前步骤内容一并传给 `credibility_analyzer.analyze_step_credibility`。  
+   - `CredibilityAnalyzer` 根据工具结果生成 5 类结论（truth / verified_facts / searchable_facts / derived_facts / educated_guess），并在必要时通过 `_ensure_complete_result` 用兜底文案补齐缺失类别。
+4. 分析结果通过 `credibility_analyzer.format_credibility_message` 包装为 `lui-message-credibility-analysis` 消息（包含 `stepTitle`、`stepIndex`、`content` 等），由 SSE 直接推送至前端。
+5. （推荐增强）后续可以在 `CredibilityAnalyzer` 内根据 5 类列表长度计算 `credibilityLevel ∈ {trusted, needs_review, untrusted}`，前端据此高亮“低可信”步骤，使本节流程与 `docs/requirements.md` 第 11.3 节保持完全一致。

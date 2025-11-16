@@ -20,11 +20,26 @@ from app.cosight.llm.chat_llm import ChatLLM
 from config.config import *
 
 
-def set_model(model_config: dict[str, Optional[str | int | float]]):
+def set_model(model_config: dict[str, Optional[str | int | float]]) -> Optional[ChatLLM]:
+    """根据配置创建 ChatLLM 实例；若配置不完整则记录告警并返回 None。"""
+    api_key = model_config.get("api_key")
+    base_url = model_config.get("base_url")
+    model_name = model_config.get("model")
+
+    # 如果关键配置缺失，不构造底层客户端，避免在启动阶段抛出异常
+    if not api_key or not base_url or not model_name:
+        logger.warning(
+            "LLM 配置不完整，跳过模型初始化: api_key=%s, base_url=%s, model=%s",
+            bool(api_key),
+            base_url,
+            model_name,
+        )
+        return None
+
     http_client_kwargs = {
         "headers": {
             'Content-Type': 'application/json',
-            'Authorization': model_config['api_key']
+            'Authorization': api_key
         },
         "verify": False,
         "trust_env": False
@@ -34,15 +49,15 @@ def set_model(model_config: dict[str, Optional[str | int | float]]):
         http_client_kwargs["proxy"] = model_config['proxy']
 
     openai_llm = OpenAI(
-        base_url=model_config['base_url'],
-        api_key=model_config['api_key'],
+        base_url=base_url,
+        api_key=api_key,
         http_client=httpx.Client(**http_client_kwargs)
     )
 
     chat_llm_kwargs = {
-        "model": model_config['model'],
-        "base_url": model_config['base_url'],
-        "api_key": model_config['api_key'],
+        "model": model_name,
+        "base_url": base_url,
+        "api_key": api_key,
         "client": openai_llm
     }
 
